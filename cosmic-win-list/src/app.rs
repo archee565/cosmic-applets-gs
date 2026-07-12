@@ -1091,9 +1091,17 @@ impl cosmic::Application for CosmicWinList {
                         ToplevelRequest::Activate(handle)
                     }));
                 }
+                let mut cmds = Vec::new();
                 if let Some(p) = self.popup.take() {
-                    return destroy_popup(p.id);
+                    cmds.push(destroy_popup(p.id));
                 }
+                self.overflow_active_popup = None;
+                self.overflow_favorites_popup = None;
+                return if cmds.is_empty() {
+                    Task::none()
+                } else {
+                    Task::batch(cmds)
+                };
             }
             Message::CloseToplevel(handle) => {
                 if let Some(tx) = self.wayland_sender.as_ref() {
@@ -1538,6 +1546,12 @@ impl cosmic::Application for CosmicWinList {
             }
             Message::DragStart(id, source) => {
                 self.drag_pending_command = None;
+                if self.popup.is_some()
+                    || self.overflow_active_popup.is_some()
+                    || self.overflow_favorites_popup.is_some()
+                {
+                    return Task::none();
+                }
                 self.drag_state = Some(DragState {
                     item_id: id,
                     from: source,
@@ -2232,7 +2246,7 @@ impl cosmic::Application for CosmicWinList {
                             dock_item.as_icon(
                                 &self.core.applet,
                                 self.rectangle_tracker.as_ref(),
-                                false,
+                                true,
                                 self.gpus.as_deref(),
                                 filtered_is_focused,
                                 dot_radius,
