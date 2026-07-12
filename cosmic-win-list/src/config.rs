@@ -20,7 +20,6 @@ pub enum ToplevelFilter {
 pub struct WinListConfig {
     pub filter_top_levels: Option<ToplevelFilter>,
     pub favorites: Vec<String>,
-    pub enable_drag_source: bool,
 }
 
 impl Default for WinListConfig {
@@ -28,7 +27,6 @@ impl Default for WinListConfig {
         Self {
             filter_top_levels: None,
             favorites: Vec::new(),
-            enable_drag_source: false,
         }
     }
 }

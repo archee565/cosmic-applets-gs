@@ -12,7 +12,7 @@ use cctk::{
     sctk::{output::OutputInfo, reexports::calloop::channel::Sender},
     toplevel_info::ToplevelInfo,
     wayland_client::protocol::{
-        wl_data_device_manager::DndAction, wl_output::WlOutput, wl_seat::WlSeat,
+        wl_output::WlOutput, wl_seat::WlSeat,
     },
     wayland_protocols::ext::{
         foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1,
@@ -30,10 +30,9 @@ use cosmic::{
     iced::{
         self, Alignment, Background, Border, Length, Limits, Padding, Subscription,
         advanced::text::{Ellipsize, EllipsizeHeightLimit},
-        clipboard::mime::{AllowedMimeTypes, AsMimeTypes},
         event::listen_with,
         platform_specific::shell::commands::popup::{destroy_popup, get_popup},
-        runtime::{core::event, dnd::peek_dnd, platform_specific::wayland::CornerRadius},
+        runtime::{core::event, platform_specific::wayland::CornerRadius},
         widget::{
             Column, Row, column, mouse_area, row,
             rule::vertical as vertical_rule,
@@ -45,7 +44,7 @@ use cosmic::{
     surface::{self, action::LiveSettings},
     theme::{self, Button, Container},
     widget::{
-        DndDestination, Image, button, container, divider, dnd_source,
+        Image, button, container, divider,
         icon::{self, from_name},
         image::Handle,
         menu,
@@ -53,20 +52,14 @@ use cosmic::{
         svg, text,
     },
 };
-use cosmic::{
-    desktop::fde::{self, DesktopEntry, get_languages_from_env, unicase::Ascii},
-    widget::DndSource,
-};
+use cosmic::desktop::fde::{self, DesktopEntry, get_languages_from_env, unicase::Ascii};
 use crate::config::{APP_ID, WinListConfig};
 use cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_handle_v1::State;
 use futures::future::pending;
 use rustc_hash::FxHashMap;
-use std::{borrow::Cow, path::PathBuf, rc::Rc, str::FromStr, time::Duration};
+use std::{borrow::Cow, rc::Rc, time::Duration};
 use switcheroo_control::Gpu;
 use tokio::time::sleep;
-use url::Url;
-
-static MIME_TYPE: &str = "text/uri-list";
 
 pub fn run() -> cosmic::iced::Result {
     cosmic::applet::run::<CosmicWinList>(())
@@ -78,9 +71,6 @@ struct AppletIconData {
     icon_spacing: f32,
     padding: Padding,
 }
-
-static DND_FAVORITES: u64 = u64::MAX;
-static DND_ACTIVE: u64 = u64::MAX - 1;
 
 impl AppletIconData {
     fn new(applet: &Context) -> Self {
@@ -145,7 +135,6 @@ impl DockItem {
         applet: &Context,
         rectangle_tracker: Option<&RectangleTracker<DockItemId>>,
         interaction_enabled: bool,
-        dnd_source_enabled: bool,
         gpus: Option<&[Gpu]>,
         is_focused: bool,
         dot_border_radius: [f32; 4],
@@ -282,26 +271,6 @@ impl DockItem {
             icon_button.into()
         };
 
-        let path = desktop_info.path.clone();
-        let icon_button = if dnd_source_enabled && interaction_enabled {
-            DndSource::with_id(icon_button, cosmic::widget::Id::new("asdfasdfadfs"))
-                .window(window_id)
-                .drag_icon(move |_| {
-                    (
-                        cosmic_icon.clone().into(),
-                        iced::core::widget::tree::State::None,
-                        iced::Vector::ZERO,
-                    )
-                })
-                .drag_threshold(16.)
-                .drag_content(move || DndPathBuf(path.clone()))
-                .on_start(Some(Message::StartDrag(*id)))
-                .on_cancel(Some(Message::DragFinished))
-                .on_finish(Some(Message::DragFinished))
-        } else {
-            dnd_source(icon_button)
-        };
-
         if let Some(tracker) = rectangle_tracker {
             tracker.container((*id).into(), icon_button).into()
         } else {
@@ -325,23 +294,6 @@ impl DockItem {
 }
 
 #[derive(Debug, Clone)]
-struct DndOffer {
-    dock_item: Option<DockItem>,
-    preview_index: usize,
-    section: u64,
-}
-
-impl Default for DndOffer {
-    fn default() -> Self {
-        Self {
-            dock_item: None,
-            preview_index: 0,
-            section: DND_FAVORITES,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
 pub struct Popup {
     parent: window::Id,
     id: window::Id,
@@ -358,15 +310,11 @@ struct CosmicWinList {
     desktop_entries: Vec<DesktopEntry>,
     active_list: Vec<DockItem>,
     pinned_list: Vec<DockItem>,
-    dnd_source: Option<(window::Id, DockItem, DndAction, usize, bool)>,
     config: WinListConfig,
     wayland_sender: Option<Sender<WaylandRequest>>,
     seat: Option<WlSeat>,
     rectangle_tracker: Option<RectangleTracker<DockItemId>>,
     rectangles: FxHashMap<DockItemId, iced::Rectangle>,
-    dnd_offer: Option<DndOffer>,
-    dnd_item_placed: bool,
-    is_listening_for_dnd: bool,
     gpus: Option<Vec<Gpu>>,
     active_workspaces: Vec<ExtWorkspaceHandleV1>,
     output_list: FxHashMap<WlOutput, OutputInfo>,
@@ -402,58 +350,11 @@ enum Message {
     NewSeat(WlSeat),
     RemovedSeat,
     Rectangle(RectangleUpdate<DockItemId>),
-    StartDrag(u32),
-    DragFinished,
-    DndEnter(f64, f64, u64),
-    DndLeave(u64),
-    DndMotion(f64, f64, u64),
-    DndDropFinished(u64),
-    DndData(Option<DndPathBuf>),
-    StartListeningForDnd,
-    StopListeningForDnd,
     IncrementSubscriptionCtr,
     ConfigUpdated(WinListConfig),
     OpenFavorites,
     OpenActive,
     Surface(surface::Action),
-}
-
-fn index_in_list(
-    mut list_len: usize,
-    item_size: f32,
-    divider_size: f32,
-    existing_preview: Option<usize>,
-    pos_in_list: f32,
-) -> usize {
-    if existing_preview.is_some() {
-        list_len += 1;
-    }
-
-    let index = if (list_len == 0) || (pos_in_list < item_size / 2.0) {
-        0
-    } else {
-        let mut i = 1;
-        let mut pos = item_size / 2.0;
-        while i < list_len {
-            let next_pos = pos + item_size + divider_size;
-            if pos < pos_in_list && pos_in_list < next_pos {
-                break;
-            }
-            pos = next_pos;
-            i += 1;
-        }
-        i
-    };
-
-    if let Some(existing_preview) = existing_preview {
-        if index >= existing_preview {
-            index.saturating_sub(1)
-        } else {
-            index
-        }
-    } else {
-        index
-    }
 }
 
 async fn try_get_gpus() -> Option<Vec<Gpu>> {
@@ -1174,186 +1075,6 @@ impl cosmic::Application for CosmicWinList {
                     return destroy_popup(popup_id);
                 }
             }
-            Message::StartDrag(id) => {
-                if let Some((is_pinned, toplevel_group, original_pos)) = self
-                    .active_list
-                    .iter()
-                    .position(|t| t.id == id)
-                    .map(|pos| (false, self.active_list[pos].clone(), pos))
-                    .or_else(|| {
-                        self.pinned_list
-                            .iter()
-                            .position(|t| t.id == id)
-                            .map(|pos| (true, self.pinned_list[pos].clone(), pos))
-                    })
-                {
-                    self.dnd_item_placed = false;
-                    let icon_id = window::Id::unique();
-                    self.dnd_source = Some((
-                        icon_id,
-                        toplevel_group.clone(),
-                        DndAction::empty(),
-                        original_pos,
-                        is_pinned,
-                    ));
-                }
-            }
-            Message::DragFinished => {
-                if let Some((_, item, _, original_pos, is_pinned)) = self.dnd_source.take() {
-                    if !self.dnd_item_placed {
-                        // Drop was cancelled or fell outside a destination:
-                        // rewind the live-reordered item to its origin.
-                        let item_id = item.id;
-                        let list = if is_pinned {
-                            &mut self.pinned_list
-                        } else {
-                            &mut self.active_list
-                        };
-                        if let Some(cur) = list.iter().position(|t| t.id == item_id) {
-                            if cur != original_pos {
-                                let moved = list.remove(cur);
-                                list.insert(original_pos.min(list.len()), moved);
-                            }
-                        }
-                    }
-                    self.dnd_item_placed = false;
-                }
-            }
-            Message::DndEnter(x, y, drag_id) => {
-                let item_size = self.core.applet.suggested_size(false).0
-                    + 2 * self.core.applet.suggested_padding(false).0;
-                let pos_in_list = match self.core.applet.anchor {
-                    PanelAnchor::Top | PanelAnchor::Bottom => x as f32,
-                    PanelAnchor::Left | PanelAnchor::Right => y as f32,
-                };
-                let list_len = if drag_id == DND_ACTIVE {
-                    self.active_list.len()
-                } else {
-                    self.pinned_list.len()
-                };
-                let index = index_in_list(list_len, item_size as f32, self.core.applet.spacing as f32, None, pos_in_list);
-                self.dnd_offer = Some(DndOffer {
-                    preview_index: index,
-                    section: drag_id,
-                    ..DndOffer::default()
-                });
-                // Only external drags carry clipboard data to peek; internal
-                // drags reorder the source item in place and need no ghost.
-                if self.dnd_source.is_none() {
-                    return peek_dnd::<DndPathBuf>()
-                        .map(Message::DndData)
-                        .map(cosmic::Action::App);
-                }
-            }
-            Message::DndMotion(x, y, drag_id) => {
-                let item_size = self.core.applet.suggested_size(false).0
-                    + 2 * self.core.applet.suggested_padding(false).0;
-                let pos_in_list = match self.core.applet.anchor {
-                    PanelAnchor::Top | PanelAnchor::Bottom => x as f32,
-                    PanelAnchor::Left | PanelAnchor::Right => y as f32,
-                };
-                if let Some(o) = self.dnd_offer.as_mut() {
-                    let list_len = if drag_id == DND_ACTIVE {
-                        self.active_list.len()
-                    } else {
-                        self.pinned_list.len()
-                    };
-                    let index = index_in_list(
-                        list_len,
-                        item_size as f32,
-                        self.core.applet.spacing as f32,
-                        Some(o.preview_index),
-                        pos_in_list,
-                    );
-                    o.preview_index = index;
-                }
-            }
-            Message::DndLeave(_drag_id) => {
-                self.dnd_offer = None;
-            }
-            Message::DndData(file_path) => {
-                let Some(file_path) = file_path else {
-                    tracing::error!("Couldn't peek at hovered path.");
-                    return Task::none();
-                };
-                if let Some(DndOffer { dock_item, .. }) = self.dnd_offer.as_mut() {
-                    if let Ok(de) = fde::DesktopEntry::from_path(file_path.0, Some(&self.locales)) {
-                        self.item_ctr += 1;
-                        *dock_item = Some(DockItem {
-                            id: self.item_ctr,
-                            toplevels: Vec::new(),
-                            original_app_id: de.id().to_string(),
-                            desktop_info: de,
-                        });
-                    }
-                }
-            }
-            Message::DndDropFinished(drag_id) => {
-                if self.dnd_source.is_some() {
-                    let (item_id, is_pinned) = self
-                        .dnd_source
-                        .as_ref()
-                        .map(|s| (s.1.id, s.4))
-                        .unwrap();
-                    let source_section = if is_pinned { DND_FAVORITES } else { DND_ACTIVE };
-                    if drag_id == source_section {
-                        let preview_index = self
-                            .dnd_offer
-                            .as_ref()
-                            .map(|o| o.preview_index)
-                            .unwrap_or(0);
-                        let list = if is_pinned {
-                            &mut self.pinned_list
-                        } else {
-                            &mut self.active_list
-                        };
-                        if let Some(cur) = list.iter().position(|t| t.id == item_id) {
-                            if cur != preview_index {
-                                let moved = list.remove(cur);
-                                let target = if preview_index > cur {
-                                    preview_index+1
-                                } else {
-                                    preview_index
-                                };
-                                list.insert(target.min(list.len()), moved);
-                            }
-                        }
-                        self.dnd_item_placed = true;
-                    }
-                    // Cross-section drops are not allowed; leaving
-                    // dnd_item_placed false rewinds the item.
-                } else if let Some((mut dock_item, index, _)) = self
-                    .dnd_offer
-                    .take()
-                    .and_then(|o| o.dock_item.map(|i| (i, o.preview_index, o.section)))
-                {
-                    // External drop (e.g. a .desktop file dragged in).
-                    if drag_id == DND_ACTIVE {
-                        // Only reorder active items that actually have windows
-                        if !dock_item.toplevels.is_empty() {
-                            let insert_idx = index.min(self.active_list.len());
-                            self.active_list.insert(insert_idx, dock_item);
-                            self.dnd_item_placed = true;
-                        }
-                    } else {
-                        dock_item.toplevels = Vec::new();
-                        if dock_item.desktop_info.exec().is_some() {
-                            self.pinned_list
-                                .insert(index.min(self.pinned_list.len()), dock_item);
-                            if let Ok(config) = Config::new(APP_ID, WinListConfig::VERSION) {
-                                self.config.update_pinned(
-                                    self.pinned_list
-                                        .iter()
-                                        .map(|di| di.original_app_id.clone())
-                                        .collect(),
-                                    &config,
-                                );
-                            }
-                            self.dnd_item_placed = true;
-                        }
-                    }
-                }
-            }
             Message::Wayland(event) => {
                 match event {
                     WaylandUpdate::Init(tx) => {
@@ -1556,12 +1277,6 @@ impl cosmic::Application for CosmicWinList {
                 if let Some(p) = self.popup.take() {
                     return destroy_popup(p.id);
                 }
-            }
-            Message::StartListeningForDnd => {
-                self.is_listening_for_dnd = true;
-            }
-            Message::StopListeningForDnd => {
-                self.is_listening_for_dnd = false;
             }
             Message::IncrementSubscriptionCtr => {
                 self.subscription_ctr += 1;
@@ -1818,7 +1533,6 @@ impl cosmic::Application for CosmicWinList {
                             &self.core.applet,
                             self.rectangle_tracker.as_ref(),
                             self.popup.is_none(),
-                            self.config.enable_drag_source,
                             self.gpus.as_deref(),
                             filtered_is_focused,
                             dot_radius,
@@ -1857,63 +1571,6 @@ impl cosmic::Application for CosmicWinList {
             favorites.push(btn);
         }
 
-        if let Some((item, index)) = self
-            .dnd_offer
-            .as_ref()
-            .filter(|o| o.section == DND_FAVORITES)
-            .and_then(|o| o.dock_item.as_ref().map(|item| (item, o.preview_index)))
-        {
-            let filtered_is_focused = item
-                .toplevels
-                .iter()
-                .filter(|(info, _)| self.is_on_current_monitor_and_workspace(info))
-                .any(|y| focused_item.contains(&y.0.foreign_toplevel));
-
-            favorites.insert(
-                index.min(favorites.len()),
-                item.as_icon(
-                    &self.core.applet,
-                    None,
-                    false,
-                    self.config.enable_drag_source,
-                    self.gpus.as_deref(),
-                    filtered_is_focused,
-                    dot_radius,
-                    self.core.main_window_id().unwrap(),
-                    Some(&|info| self.is_on_current_monitor_and_workspace(info)),
-                ),
-            );
-        } else if let Some(o) = self
-            .dnd_offer
-            .as_ref()
-            .filter(|o| o.section == DND_FAVORITES && o.dock_item.is_none())
-        {
-            if self.dnd_source.is_some() {
-                let marker = container(if is_horizontal {
-                    vertical_space().width(Length::Fixed(2.0))
-                } else {
-                    horizontal_space().height(Length::Fixed(2.0))
-                })
-                .class(theme::Container::custom(move |theme| container::Style {
-                    background: Some(Background::Color(
-                        theme.cosmic().accent_color().into(),
-                    )),
-                    ..Default::default()
-                }));
-                favorites.insert(o.preview_index.min(favorites.len()), marker.into());
-            }
-        } else if self.is_listening_for_dnd && self.pinned_list.is_empty() {
-            // show star indicating pinned_list is drag target
-            favorites.push(
-                container(
-                    icon::from_name("starred-symbolic.symbolic")
-                        .size(self.core.applet.suggested_size(false).0),
-                )
-                .padding(self.core.applet.suggested_padding(false).1) // TODO
-                .into(),
-            );
-        }
-
         let filtered_active_list: Vec<_> = self
             .active_list
             .iter()
@@ -1947,7 +1604,6 @@ impl cosmic::Application for CosmicWinList {
                                 &self.core.applet,
                                 self.rectangle_tracker.as_ref(),
                                 self.popup.is_none(),
-                                self.config.enable_drag_source,
                                 self.gpus.as_deref(),
                                 filtered_is_focused,
                                 dot_radius,
@@ -1986,56 +1642,6 @@ impl cosmic::Application for CosmicWinList {
             active.push(btn);
         }
 
-        // DND preview for active section
-        if let Some((item, index)) = self
-            .dnd_offer
-            .as_ref()
-            .filter(|o| o.section == DND_ACTIVE)
-            .and_then(|o| o.dock_item.as_ref().map(|item| (item, o.preview_index)))
-        {
-            let filtered_is_focused = item
-                .toplevels
-                .iter()
-                .filter(|(info, _)| self.is_on_current_monitor_and_workspace(info))
-                .any(|y| focused_item.contains(&y.0.foreign_toplevel));
-
-            active.insert(
-                index.min(active.len()),
-                item.as_icon(
-                    &self.core.applet,
-                    None,
-                    false,
-                    self.config.enable_drag_source,
-                    self.gpus.as_deref(),
-                    filtered_is_focused,
-                    dot_radius,
-                    self.core.main_window_id().unwrap(),
-                    Some(&|info| self.is_on_current_monitor_and_workspace(info)),
-                ),
-            );
-        }
-
-        if let Some(o) = self
-            .dnd_offer
-            .as_ref()
-            .filter(|o| o.section == DND_ACTIVE && o.dock_item.is_none())
-        {
-            if self.dnd_source.is_some() {
-                let marker = container(if is_horizontal {
-                    vertical_space().width(Length::Fixed(2.0))
-                } else {
-                    horizontal_space().height(Length::Fixed(2.0))
-                })
-                .class(theme::Container::custom(move |theme| container::Style {
-                    background: Some(Background::Color(
-                        theme.cosmic().accent_color().into(),
-                    )),
-                    ..Default::default()
-                }));
-                active.insert(o.preview_index.min(active.len()), marker.into());
-            }
-        }
-
         let window_size = self.core.applet.suggested_bounds.as_ref();
         let max_num = if self.core.applet.is_horizontal() {
             let suggested_width = self.core.applet.suggested_size(false).0
@@ -2056,20 +1662,12 @@ impl cosmic::Application for CosmicWinList {
             favorites.truncate(max_num - active_leftover);
             active.truncate(active_leftover);
         }
-        let (w, h, favorites, active, divider) = if is_horizontal {
+        let (w, h, favorites, active, divider): (Length, Length, Element<'_, Message>, Element<'_, Message>, _) = if is_horizontal {
             (
                 Length::Shrink,
                 Length::Shrink,
-                DndDestination::for_data::<DndPathBuf>(
-                    row(favorites).spacing(app_icon.icon_spacing),
-                    |_, _| Message::DndDropFinished(DND_FAVORITES),
-                )
-                .drag_id(DND_FAVORITES),
-                DndDestination::for_data::<DndPathBuf>(
-                    row(active).spacing(app_icon.icon_spacing),
-                    |_, _| Message::DndDropFinished(DND_ACTIVE),
-                )
-                .drag_id(DND_ACTIVE),
+                row(favorites).spacing(app_icon.icon_spacing).into(),
+                row(active).spacing(app_icon.icon_spacing).into(),
                 container(vertical_rule(1))
                     .height(Length::Fill)
                     .padding([divider_padding, 0])
@@ -2079,16 +1677,8 @@ impl cosmic::Application for CosmicWinList {
             (
                 Length::Shrink,
                 Length::Shrink,
-                DndDestination::for_data(
-                    column(favorites).spacing(app_icon.icon_spacing),
-                    |_data: Option<DndPathBuf>, _| Message::DndDropFinished(DND_FAVORITES),
-                )
-                .drag_id(DND_FAVORITES),
-                DndDestination::for_data(
-                    column(active).spacing(app_icon.icon_spacing),
-                    |_data: Option<DndPathBuf>, _| Message::DndDropFinished(DND_ACTIVE),
-                )
-                .drag_id(DND_ACTIVE),
+                column(favorites).spacing(app_icon.icon_spacing).into(),
+                column(active).spacing(app_icon.icon_spacing).into(),
                 container(divider::horizontal::default())
                     .width(Length::Fill)
                     .padding([0, divider_padding])
@@ -2096,19 +1686,7 @@ impl cosmic::Application for CosmicWinList {
             )
         };
 
-        let favorites = favorites
-            .on_enter(|x, y, _| Message::DndEnter(x, y, DND_FAVORITES))
-            .on_motion(|x, y| Message::DndMotion(x, y, DND_FAVORITES))
-            .on_leave(|| Message::DndLeave(DND_FAVORITES));
-
-        let active = active
-            .on_enter(|x, y, _| Message::DndEnter(x, y, DND_ACTIVE))
-            .on_motion(|x, y| Message::DndMotion(x, y, DND_ACTIVE))
-            .on_leave(|| Message::DndLeave(DND_ACTIVE));
-
-        let show_pinned = !self.pinned_list.is_empty()
-            || self.is_listening_for_dnd
-            || self.dnd_offer.as_ref().is_some_and(|o| o.section == DND_FAVORITES);
+        let show_pinned = !self.pinned_list.is_empty();
         let content_list: Vec<Element<_>> = if show_pinned && !self.active_list.is_empty() {
             vec![favorites.into(), divider, active.into()]
         } else if show_pinned {
@@ -2165,14 +1743,7 @@ impl cosmic::Application for CosmicWinList {
     fn view_window(&self, id: window::Id) -> Element<'_, Message> {
         let theme = self.core.system_theme();
 
-        if let Some((_, item, _, _, _)) = self.dnd_source.as_ref().filter(|s| s.0 == id) {
-            cosmic::widget::icon(
-                fde::IconSource::from_unknown(item.desktop_info.icon().unwrap_or_default())
-                    .as_cosmic_icon(),
-            )
-            .size(self.core.applet.suggested_size(false).0)
-            .into()
-        } else if let Some(Popup {
+        if let Some(Popup {
             dock_item: DockItem { id, .. },
             popup_type,
             ..
@@ -2416,7 +1987,6 @@ impl cosmic::Application for CosmicWinList {
                                 &self.core.applet,
                                 self.rectangle_tracker.as_ref(),
                                 self.popup.is_none(),
-                                self.config.enable_drag_source,
                                 self.gpus.as_deref(),
                                 filtered_is_focused,
                                 dot_radius,
@@ -2505,7 +2075,6 @@ impl cosmic::Application for CosmicWinList {
                                 &self.core.applet,
                                 self.rectangle_tracker.as_ref(),
                                 self.popup.is_none(),
-                                self.config.enable_drag_source,
                                 self.gpus.as_deref(),
                                 filtered_is_focused,
                                 dot_radius,
@@ -2616,43 +2185,4 @@ where
 {
     gpus.position(|gpu| gpu.default ^ desktop_info.prefers_non_default_gpu())
         .unwrap_or(0)
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct DndPathBuf(PathBuf);
-
-impl AllowedMimeTypes for DndPathBuf {
-    fn allowed() -> std::borrow::Cow<'static, [String]> {
-        std::borrow::Cow::Owned(vec![MIME_TYPE.to_string()])
-    }
-}
-
-impl TryFrom<(Vec<u8>, String)> for DndPathBuf {
-    type Error = anyhow::Error;
-
-    fn try_from((data, mime_type): (Vec<u8>, String)) -> Result<Self, Self::Error> {
-        if mime_type == MIME_TYPE {
-            if let Some(p) = String::from_utf8(data)
-                .ok()
-                .and_then(|s| Url::from_str(&s).ok())
-                .and_then(|u| u.to_file_path().ok())
-            {
-                Ok(DndPathBuf(p))
-            } else {
-                anyhow::bail!("Failed to parse.")
-            }
-        } else {
-            anyhow::bail!("Invalid mime type.")
-        }
-    }
-}
-
-impl AsMimeTypes for DndPathBuf {
-    fn available(&self) -> std::borrow::Cow<'static, [String]> {
-        std::borrow::Cow::Owned(vec![MIME_TYPE.to_string()])
-    }
-
-    fn as_bytes(&self, _mime_type: &str) -> Option<std::borrow::Cow<'static, [u8]>> {
-        Some(Cow::Owned(self.0.to_str()?.as_bytes().to_vec()))
-    }
 }
