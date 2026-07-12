@@ -400,6 +400,7 @@ enum Message {
     DragStart(u32, DragSource),
     DragMove(iced::Point),
     DragTick,
+    CursorLeft,
 }
 
 async fn try_get_gpus() -> Option<Vec<Gpu>> {
@@ -669,8 +670,8 @@ impl CosmicWinList {
         max_major_axis_len -= 1;
         let applet_icon = AppletIconData::new(&self.core.applet);
 
-        let button_total_size = self.core.applet.suggested_size(true).0
-            + self.core.applet.suggested_padding(true).0 * 2
+        let button_total_size = self.core.applet.suggested_size(false).0
+            + self.core.applet.suggested_padding(false).0 * 2
             + applet_icon.icon_spacing as u16;
 
         // Only pinned launchers whose app has *no* open windows are visible – any
@@ -687,7 +688,7 @@ impl CosmicWinList {
         if btn_count >= visible_pinned_len as u32 + self.active_list.len() as u32 {
             return (None, active_index);
         } else {
-            favorite_index = (btn_count as usize).min(visible_pinned_len).max(2);
+            favorite_index = (btn_count as usize).min(visible_pinned_len);
         }
 
         // calculation of active_index based on favorite_index if there is still not enough space
@@ -702,7 +703,7 @@ impl CosmicWinList {
         // final calculation of favorite_index if there is still not enough space
         if let Some(active_index) = active_index {
             let favorite_index_max = (btn_count as i32) - active_index as i32;
-            favorite_index = favorite_index_max.max(2) as usize;
+            favorite_index = favorite_index_max.max(0) as usize;
         } else {
             favorite_index = (btn_count as usize).min(visible_pinned_len);
         }
@@ -1367,15 +1368,10 @@ impl cosmic::Application for CosmicWinList {
                 if create_new {
                     let new_id = window::Id::unique();
                     self.overflow_active_popup = Some(new_id);
-                    let Some(iced::Rectangle {
-                        x,
-                        y,
-                        width,
-                        height,
-                    }) = self.rectangles.get(&DockItemId::ActiveOverflow).copied()
-                    else {
-                        return Task::none();
-                    };
+                    let anchor_rect = self
+                        .rectangles
+                        .get(&DockItemId::ActiveOverflow)
+                        .copied();
 
                     let popup_task =
                         cosmic::surface::surface_task(cosmic::surface::action::app_popup(
@@ -1392,12 +1388,15 @@ impl cosmic::Application for CosmicWinList {
                                     None,
                                 );
 
-                                popup_settings.positioner.anchor_rect = iced::Rectangle::<i32> {
-                                    x: x as i32,
-                                    y: y as i32,
-                                    width: width as i32,
-                                    height: height as i32,
-                                };
+                                if let Some(rect) = anchor_rect {
+                                    popup_settings.positioner.anchor_rect =
+                                        iced::Rectangle::<i32> {
+                                            x: rect.x as i32,
+                                            y: rect.y as i32,
+                                            width: rect.width as i32,
+                                            height: rect.height as i32,
+                                        };
+                                }
 
                                 let applet_suggested_size = app.core.applet.suggested_size(false).0
                                     + 2 * app.core.applet.suggested_padding(false).0;
@@ -1531,6 +1530,10 @@ impl cosmic::Application for CosmicWinList {
                 } else if let Some(cmd) = self.drag_pending_command.take() {
                     return Task::done(cosmic::Action::App(*cmd));
                 }
+                self.drag_pending_command = None;
+            }
+            Message::CursorLeft => {
+                self.drag_state = None;
                 self.drag_pending_command = None;
             }
             Message::DragStart(id, source) => {
@@ -1715,7 +1718,7 @@ impl cosmic::Application for CosmicWinList {
                 if size <= small_size_threshold { 4 } else { 8 }
             }
         };
-        let (favorite_popup_cutoff, active_popup_cutoff) = self.panel_overflow_lengths();
+        let (_favorite_popup_cutoff, active_popup_cutoff) = self.panel_overflow_lengths();
 
         // Only pinned launchers whose app has *no* active windows are shown.
         let visible_pinned: Vec<_> = self
@@ -1723,27 +1726,8 @@ impl cosmic::Application for CosmicWinList {
             .iter()
             .filter(|item| !self.pinned_has_active_window(&item.original_app_id))
             .collect();
-        let visible_pinned_len = visible_pinned.len();
-
-        let mut favorite_to_remove = match favorite_popup_cutoff {
-            Some(cutoff) if cutoff < visible_pinned_len => visible_pinned_len - cutoff + 1,
-            _ => 0,
-        };
         let favorites: Vec<_> = visible_pinned
             .iter()
-            .rev()
-            .filter(|f| {
-                if favorite_to_remove > 0 && f.toplevels.is_empty() {
-                    favorite_to_remove -= 1;
-                    false
-                } else {
-                    true
-                }
-            })
-            .collect();
-        let mut favorites: Vec<_> = favorites[favorite_to_remove..]
-            .iter()
-            .rev()
             .map(|dock_item| {
                 let filtered_is_focused = dock_item
                     .toplevels
@@ -1774,29 +1758,6 @@ impl cosmic::Application for CosmicWinList {
                     .into()
             })
             .collect();
-
-        if favorite_popup_cutoff.is_some() {
-            // button to show more favorites
-            let icon = match self.core.applet.anchor {
-                PanelAnchor::Bottom => "go-up-symbolic",
-                PanelAnchor::Left => "go-next-symbolic",
-                PanelAnchor::Right => "go-previous-symbolic",
-                PanelAnchor::Top => "go-down-symbolic",
-            };
-            let btn = self
-                .core
-                .applet
-                .icon_button(icon)
-                .on_press(Message::OpenFavorites);
-            let btn: Element<_> = if let Some(rectangle_tracker) = self.rectangle_tracker.as_ref() {
-                rectangle_tracker
-                    .container(DockItemId::FavoritesOverflow, btn)
-                    .into()
-            } else {
-                btn.into()
-            };
-            favorites.push(btn);
-        }
 
         let filtered_active_list: Vec<_> = self
             .active_list
@@ -1852,8 +1813,7 @@ impl cosmic::Application for CosmicWinList {
             // button to show more active
             let icon = match self.core.applet.anchor {
                 PanelAnchor::Bottom => "go-up-symbolic",
-                PanelAnchor::Left => "go-next-symbolic",
-                PanelAnchor::Right => "go-previous-symbolic",
+                PanelAnchor::Left | PanelAnchor::Right => "go-down-symbolic",
                 PanelAnchor::Top => "go-down-symbolic",
             };
             let btn = self
@@ -1873,23 +1833,48 @@ impl cosmic::Application for CosmicWinList {
 
         let window_size = self.core.applet.suggested_bounds.as_ref();
         let max_num = if self.core.applet.is_horizontal() {
-            let suggested_width = self.core.applet.suggested_size(false).0
-                + self.core.applet.suggested_padding(false).0 * 2;
+            let button_total = self.core.applet.suggested_size(false).0
+                + self.core.applet.suggested_padding(false).0 * 2
+                + app_icon.icon_spacing as u16;
             window_size
                 .map(|w| w.width)
-                .map_or(u32::MAX, |b| (b / suggested_width as f32) as u32) as usize
+                .map_or(u32::MAX, |b| (b / button_total as f32) as u32) as usize
         } else {
-            let suggested_height = self.core.applet.suggested_size(false).1
-                + self.core.applet.suggested_padding(false).0 * 2;
+            let button_total = self.core.applet.suggested_size(false).1
+                + self.core.applet.suggested_padding(false).0 * 2
+                + app_icon.icon_spacing as u16;
             window_size
                 .map(|w| w.height)
-                .map_or(u32::MAX, |b| (b / suggested_height as f32) as u32) as usize
+                .map_or(u32::MAX, |b| (b / button_total as f32) as u32) as usize
         }
         .max(4);
         if max_num < favorites.len() + active.len() {
-            let active_leftover = max_num.saturating_sub(favorites.len());
-            favorites.truncate(max_num - active_leftover);
-            active.truncate(active_leftover);
+            let available = max_num.saturating_sub(favorites.len());
+            let original_active_len = active.len();
+            active.truncate(available.saturating_sub(1));
+
+            // If items were removed and there's room for at least the
+            // overflow button, push one regardless of primary overflow
+            if active.len() < original_active_len && available >= 1 {
+                let icon = match self.core.applet.anchor {
+                    PanelAnchor::Bottom => "go-up-symbolic",
+                    PanelAnchor::Left | PanelAnchor::Right => "go-down-symbolic",
+                    PanelAnchor::Top => "go-down-symbolic",
+                };
+                let btn = self
+                    .core
+                    .applet
+                    .icon_button(icon)
+                    .on_press(Message::OpenActive);
+                let btn: Element<_> = if let Some(tracker) = self.rectangle_tracker.as_ref() {
+                    tracker
+                        .container(DockItemId::ActiveOverflow, btn)
+                        .into()
+                } else {
+                    btn.into()
+                };
+                active.push(btn);
+            }
         }
         let (w, h, favorites, active, divider): (Length, Length, Element<'_, Message>, Element<'_, Message>, _) = if is_horizontal {
             (
@@ -2194,16 +2179,46 @@ impl cosmic::Application for CosmicWinList {
                 })
                 .collect();
 
+            // Calculate how many active items fit in the main view
+            let applet_icon_data = AppletIconData::new(&self.core.applet);
+            let button_total = self.core.applet.suggested_size(false).0
+                + self.core.applet.suggested_padding(false).0 * 2
+                + applet_icon_data.icon_spacing as u16;
+            let max_total = self
+                .core
+                .applet
+                .suggested_bounds
+                .as_ref()
+                .map(|b| {
+                    let size = if self.core.applet.is_horizontal() {
+                        b.width
+                    } else {
+                        b.height
+                    };
+                    (size / button_total as f32) as usize
+                })
+                .unwrap_or(usize::MAX)
+                .max(4);
+            let visible_favorites = self
+                .pinned_list
+                .iter()
+                .filter(|item| !self.pinned_has_active_window(&item.original_app_id))
+                .count();
+            let visible_active = active_popup_cutoff.map_or_else(
+                || {
+                    max_total
+                        .saturating_sub(visible_favorites)
+                        .saturating_sub(1)
+                },
+                |n| n.saturating_sub(1),
+            );
+            let popup_count =
+                filtered_active_list.len().saturating_sub(visible_active);
+
             let active: Vec<_> = filtered_active_list
                 .iter()
                 .rev()
-                .take(active_popup_cutoff.map_or(filtered_active_list.len(), |n| {
-                    if n < filtered_active_list.len() {
-                        filtered_active_list.len() - n + 1
-                    } else {
-                        0
-                    }
-                }))
+                .take(popup_count)
                 .map(|dock_item| {
                     let filtered_is_focused = dock_item
                         .toplevels
@@ -2217,14 +2232,14 @@ impl cosmic::Application for CosmicWinList {
                             dock_item.as_icon(
                                 &self.core.applet,
                                 self.rectangle_tracker.as_ref(),
-                                self.popup.is_none(),
+                                false,
                                 self.gpus.as_deref(),
                                 filtered_is_focused,
                                 dot_radius,
                                 id,
                                 Some(&|info| self.is_on_current_monitor_and_workspace(info)),
                                 DragSource::Active,
-                                self.drag_state.as_ref().map(|d| (d.item_id, d.from)),
+                                None,
                             ),
                             dock_item.tooltip_text(&self.locales).into_owned(),
                             self.popup.is_some() || self.drag_state.is_some(),
@@ -2285,10 +2300,10 @@ impl cosmic::Application for CosmicWinList {
                 .iter()
                 .filter(|item| !self.pinned_has_active_window(&item.original_app_id))
                 .collect();
-            let visible_pinned_len = visible_pinned.len();
+        let _visible_pinned_len = visible_pinned.len();
 
             let overflow_favorites = match favorite_popup_cutoff {
-                Some(cutoff) if cutoff < visible_pinned_len => &visible_pinned[cutoff..],
+                Some(cutoff) if cutoff < _visible_pinned_len => &visible_pinned[cutoff..],
                 _ => &[],
             };
 
@@ -2307,14 +2322,14 @@ impl cosmic::Application for CosmicWinList {
                         dock_item.as_icon(
                             &self.core.applet,
                             self.rectangle_tracker.as_ref(),
-                            self.popup.is_none(),
+                            false,
                             self.gpus.as_deref(),
                             filtered_is_focused,
                             dot_radius,
                             id,
                             Some(&|info| self.is_on_current_monitor_and_workspace(info)),
                             DragSource::Favorites,
-                            self.drag_state.as_ref().map(|d| (d.item_id, d.from)),
+                            None,
                         ),
                         dock_item.tooltip_text(&self.locales).to_string(),
                         self.popup.is_some() || self.drag_state.is_some(),
@@ -2388,6 +2403,9 @@ impl cosmic::Application for CosmicWinList {
                         iced::Point::new(position.x, position.y),
                     ))
                 }
+                cosmic::iced::core::Event::Mouse(
+                    cosmic::iced::core::mouse::Event::CursorLeft,
+                ) => Some(Message::CursorLeft),
                 _ => None,
             }),
             rectangle_tracker_subscription(0).map(|update| Message::Rectangle(update.1)),
