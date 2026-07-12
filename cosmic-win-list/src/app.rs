@@ -358,7 +358,7 @@ struct CosmicWinList {
     desktop_entries: Vec<DesktopEntry>,
     active_list: Vec<DockItem>,
     pinned_list: Vec<DockItem>,
-    dnd_source: Option<(window::Id, DockItem, DndAction, usize, bool, f32)>,
+    dnd_source: Option<(window::Id, DockItem, DndAction, usize, bool)>,
     config: WinListConfig,
     wayland_sender: Option<Sender<WaylandRequest>>,
     seat: Option<WlSeat>,
@@ -1187,34 +1187,19 @@ impl cosmic::Application for CosmicWinList {
                             .map(|pos| (true, self.pinned_list[pos].clone(), pos))
                     })
                 {
-                    // Keep the item in its source list during the drag so it
-                    // live-reorders with the cursor. Only stash a clone for
-                    // the drag-icon surface and bookkeeping needed to rewind.
                     self.dnd_item_placed = false;
                     let icon_id = window::Id::unique();
-                    // Snapshot the item's current visual position so
-                    // subsequent DndMotion events can compute the cursor's
-                    // relative displacement without rectangle-tracker lag.
-                    let initial_rect_pos = self
-                        .rectangles
-                        .get(&DockItemId::Item(toplevel_group.id))
-                        .map(|r| match self.core.applet.anchor {
-                            PanelAnchor::Top | PanelAnchor::Bottom => r.x,
-                            PanelAnchor::Left | PanelAnchor::Right => r.y,
-                        })
-                        .unwrap_or(0.0);
                     self.dnd_source = Some((
                         icon_id,
                         toplevel_group.clone(),
                         DndAction::empty(),
                         original_pos,
                         is_pinned,
-                        initial_rect_pos,
                     ));
                 }
             }
             Message::DragFinished => {
-                if let Some((_, item, _, original_pos, is_pinned, _)) = self.dnd_source.take() {
+                if let Some((_, item, _, original_pos, is_pinned)) = self.dnd_source.take() {
                     if !self.dnd_item_placed {
                         // Drop was cancelled or fell outside a destination:
                         // rewind the live-reordered item to its origin.
@@ -1246,7 +1231,7 @@ impl cosmic::Application for CosmicWinList {
                 } else {
                     self.pinned_list.len()
                 };
-                let index = index_in_list(list_len, item_size as f32, 4.0, None, pos_in_list);
+                let index = index_in_list(list_len, item_size as f32, self.core.applet.spacing as f32, None, pos_in_list);
                 self.dnd_offer = Some(DndOffer {
                     preview_index: index,
                     section: drag_id,
@@ -1276,52 +1261,11 @@ impl cosmic::Application for CosmicWinList {
                     let index = index_in_list(
                         list_len,
                         item_size as f32,
-                        4.0,
+                        self.core.applet.spacing as f32,
                         Some(o.preview_index),
                         pos_in_list,
                     );
                     o.preview_index = index;
-                }
-                // Live-reorder the dragged item within its source section as
-                // the cursor moves over it. Cross-section motion does not move
-                // the item until the drop is accepted.
-                let internal = self.dnd_source.as_ref().map(|s| (s.1.id, s.4));
-                if let Some((item_id, is_pinned)) = internal {
-                    let source_section = if is_pinned { DND_FAVORITES } else { DND_ACTIVE };
-                    if drag_id == source_section {
-                        let list = if is_pinned {
-                            &mut self.pinned_list
-                        } else {
-                            &mut self.active_list
-                        };
-                        if let Some(cur) = list.iter().position(|t| t.id == item_id) {
-                            // Use the snapshot taken at StartDrag (the item's
-                            // visual position when the drag began) to compute
-                            // the cursor's displacement. This avoids the
-                            // one-frame lag of the rectangle tracker, so the
-                            // item never temporarily lands at the list boundary
-                            // and follows the cursor at full speed.
-                            let stride =
-                                item_size as f32 + self.core.applet.spacing as f32;
-                            let (_, _, _, original_pos, _, initial_rect_pos) =
-                                self.dnd_source.as_ref().unwrap();
-                            let orig_pos = *original_pos;
-                            let init_pos = *initial_rect_pos;
-                            // `floor` maps the cursor onto the 0-based slot it
-                            // actually occupies, unlike `round` which would
-                            // snap to the right-half-of-slot boundary and
-                            // yield one slot too high near each slot's end.
-                            let slots_moved = ((pos_in_list - init_pos) / stride)
-                                .floor() as isize;
-                            let target = (orig_pos as isize + slots_moved)
-                                .max(0)
-                                .min(list.len() as isize - 1) as usize;
-                            if target != cur {
-                                let moved = list.remove(cur);
-                                list.insert(target.min(list.len()), moved);
-                            }
-                        }
-                    }
                 }
             }
             Message::DndLeave(_drag_id) => {
@@ -1346,13 +1290,34 @@ impl cosmic::Application for CosmicWinList {
             }
             Message::DndDropFinished(drag_id) => {
                 if self.dnd_source.is_some() {
-                    let (_, is_pinned) = self
+                    let (item_id, is_pinned) = self
                         .dnd_source
                         .as_ref()
                         .map(|s| (s.1.id, s.4))
                         .unwrap();
                     let source_section = if is_pinned { DND_FAVORITES } else { DND_ACTIVE };
                     if drag_id == source_section {
+                        let preview_index = self
+                            .dnd_offer
+                            .as_ref()
+                            .map(|o| o.preview_index)
+                            .unwrap_or(0);
+                        let list = if is_pinned {
+                            &mut self.pinned_list
+                        } else {
+                            &mut self.active_list
+                        };
+                        if let Some(cur) = list.iter().position(|t| t.id == item_id) {
+                            if cur != preview_index {
+                                let moved = list.remove(cur);
+                                let target = if preview_index > cur {
+                                    preview_index+1
+                                } else {
+                                    preview_index
+                                };
+                                list.insert(target.min(list.len()), moved);
+                            }
+                        }
                         self.dnd_item_placed = true;
                     }
                     // Cross-section drops are not allowed; leaving
@@ -1918,6 +1883,25 @@ impl cosmic::Application for CosmicWinList {
                     Some(&|info| self.is_on_current_monitor_and_workspace(info)),
                 ),
             );
+        } else if let Some(o) = self
+            .dnd_offer
+            .as_ref()
+            .filter(|o| o.section == DND_FAVORITES && o.dock_item.is_none())
+        {
+            if self.dnd_source.is_some() {
+                let marker = container(if is_horizontal {
+                    vertical_space().width(Length::Fixed(2.0))
+                } else {
+                    horizontal_space().height(Length::Fixed(2.0))
+                })
+                .class(theme::Container::custom(move |theme| container::Style {
+                    background: Some(Background::Color(
+                        theme.cosmic().accent_color().into(),
+                    )),
+                    ..Default::default()
+                }));
+                favorites.insert(o.preview_index.min(favorites.len()), marker.into());
+            }
         } else if self.is_listening_for_dnd && self.pinned_list.is_empty() {
             // show star indicating pinned_list is drag target
             favorites.push(
@@ -2029,6 +2013,27 @@ impl cosmic::Application for CosmicWinList {
                     Some(&|info| self.is_on_current_monitor_and_workspace(info)),
                 ),
             );
+        }
+
+        if let Some(o) = self
+            .dnd_offer
+            .as_ref()
+            .filter(|o| o.section == DND_ACTIVE && o.dock_item.is_none())
+        {
+            if self.dnd_source.is_some() {
+                let marker = container(if is_horizontal {
+                    vertical_space().width(Length::Fixed(2.0))
+                } else {
+                    horizontal_space().height(Length::Fixed(2.0))
+                })
+                .class(theme::Container::custom(move |theme| container::Style {
+                    background: Some(Background::Color(
+                        theme.cosmic().accent_color().into(),
+                    )),
+                    ..Default::default()
+                }));
+                active.insert(o.preview_index.min(active.len()), marker.into());
+            }
         }
 
         let window_size = self.core.applet.suggested_bounds.as_ref();
@@ -2160,7 +2165,7 @@ impl cosmic::Application for CosmicWinList {
     fn view_window(&self, id: window::Id) -> Element<'_, Message> {
         let theme = self.core.system_theme();
 
-        if let Some((_, item, _, _, _, _)) = self.dnd_source.as_ref().filter(|s| s.0 == id) {
+        if let Some((_, item, _, _, _)) = self.dnd_source.as_ref().filter(|s| s.0 == id) {
             cosmic::widget::icon(
                 fde::IconSource::from_unknown(item.desktop_info.icon().unwrap_or_default())
                     .as_cosmic_icon(),
