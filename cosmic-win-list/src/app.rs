@@ -147,6 +147,7 @@ impl DockItem {
         window_id: window::Id,
         filter: Option<&dyn Fn(&ToplevelInfo) -> bool>,
         drag_source: DragSource,
+        dragged_item_id: Option<(u32, DragSource)>,
     ) -> Element<'_, Message> {
         let Self {
             toplevels,
@@ -154,6 +155,8 @@ impl DockItem {
             id,
             ..
         } = self;
+
+        let is_dragged = dragged_item_id == Some((*id, drag_source));
 
         let filtered_toplevels: Vec<_> = if let Some(filter_fn) = filter {
             toplevels
@@ -280,6 +283,20 @@ impl DockItem {
             .into()
         } else {
             icon_button.into()
+        };
+
+        let icon_button: Element<_> = if is_dragged {
+            use cosmic::iced::Color;
+            let dim_overlay = container(row![])
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .style(move |_theme| container::Style {
+                    background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.45))),
+                    ..Default::default()
+                });
+            stack![icon_button, dim_overlay].into()
+        } else {
+            icon_button
         };
 
         if let Some(tracker) = rectangle_tracker {
@@ -1747,6 +1764,7 @@ impl cosmic::Application for CosmicWinList {
                             self.core.main_window_id().unwrap(),
                             Some(&|info| self.is_on_current_monitor_and_workspace(info)),
                             DragSource::Favorites,
+                            self.drag_state.as_ref().map(|d| (d.item_id, d.from)),
                         ),
                         dock_item.tooltip_text(&self.locales).into_owned(),
                         self.popup.is_some() || self.drag_state.is_some(),
@@ -1795,7 +1813,7 @@ impl cosmic::Application for CosmicWinList {
                 if n < filtered_active_list.len() {
                     n.saturating_sub(1)
                 } else {
-                    n
+                    filtered_active_list.len()
                 }
             })]
                 .iter()
@@ -1819,6 +1837,7 @@ impl cosmic::Application for CosmicWinList {
                                 self.core.main_window_id().unwrap(),
                                 Some(&|info| self.is_on_current_monitor_and_workspace(info)),
                                 DragSource::Active,
+                                self.drag_state.as_ref().map(|d| (d.item_id, d.from)),
                             ),
                             dock_item.tooltip_text(&self.locales).into_owned(),
                             self.popup.is_some() || self.drag_state.is_some(),
@@ -1942,6 +1961,8 @@ impl cosmic::Application for CosmicWinList {
                 limits = limits.max_height(b.height);
             }
         }
+
+        let content: Element<_> = content.into();
 
         self.core
             .applet
@@ -2203,6 +2224,7 @@ impl cosmic::Application for CosmicWinList {
                                 id,
                                 Some(&|info| self.is_on_current_monitor_and_workspace(info)),
                                 DragSource::Active,
+                                self.drag_state.as_ref().map(|d| (d.item_id, d.from)),
                             ),
                             dock_item.tooltip_text(&self.locales).into_owned(),
                             self.popup.is_some() || self.drag_state.is_some(),
@@ -2292,6 +2314,7 @@ impl cosmic::Application for CosmicWinList {
                             id,
                             Some(&|info| self.is_on_current_monitor_and_workspace(info)),
                             DragSource::Favorites,
+                            self.drag_state.as_ref().map(|d| (d.item_id, d.from)),
                         ),
                         dock_item.tooltip_text(&self.locales).to_string(),
                         self.popup.is_some() || self.drag_state.is_some(),
