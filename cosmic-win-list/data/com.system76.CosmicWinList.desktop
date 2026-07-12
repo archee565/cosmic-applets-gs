@@ -1,0 +1,16 @@
+[Desktop Entry]
+Name=Window List
+Comment=Open windows of every app shown individually
+Type=Application
+Exec=cosmic-win-list
+Terminal=false
+Categories=COSMIC;
+Keywords=COSMIC;Applet;Window;List;Task;Bar;Ungrouped;
+Icon=com.system76.CosmicWinList
+StartupNotify=true
+NoDisplay=true
+X-CosmicApplet=true
+X-MinimizeApplet=5
+X-OverflowPriority=100
+X-OverflowMinSize=4
+X-HostWaylandDisplay=true

@@ -1,0 +1,51 @@
+rootdir := ''
+prefix := '/usr'
+debug := '0'
+target := if debug == '1' { 'debug' } else { 'release' }
+targetdir := env('CARGO_TARGET_DIR', 'target')
+debug_args := if debug == '1' { '' } else { '--release' }
+
+sharedir := rootdir + prefix + '/share'
+iconsdir := sharedir + '/icons/hicolor'
+bindir := rootdir + prefix + '/bin'
+default-schema-target := sharedir + '/cosmic'
+app-id := 'com.system76.CosmicWinList'
+name := 'cosmic-win-list'
+
+default: build-release
+
+# Compiles with debug profile
+build-debug *args:
+    cargo build {{ args }}
+
+# Compiles with release profile
+build-release *args: (build-debug '--release' args)
+
+# Compile with offline vendored tarball (if ~/.cargo vendored)
+build-vendored *args: (build-release '--frozen --offline' args)
+
+_install-icon:
+    find data/'icons' -type f -exec echo {} \; | rev | cut -d'/' -f-3 | rev | xargs -d '\n' -I {} install -Dm0644 data/'icons'/{} {{ iconsdir }}/{}
+
+_install-desktop:
+    install -Dm0644 data/{{ app-id }}.desktop {{ sharedir }}/applications/{{ app-id }}.desktop
+
+_install-schema:
+    find data/'default_schema' -type f -exec echo {} \; | rev | cut -d'/' -f-3 | rev | xargs -d '\n' -I {} install -Dm0644 data/'default_schema'/{} {{ default-schema-target }}/{}
+
+_install-bin:
+    install -Dm0755 {{ targetdir }}/{{ target }}/{{ name }} {{ bindir }}/{{ name }}
+
+# Installs the applet into the system
+install: (_install-bin) (_install-icon) (_install-desktop) (_install-schema)
+
+# Removes everything installed by `install`
+uninstall:
+    rm -f {{ bindir }}/{{ name }}
+    find data/'icons' -type f -exec sh -c 'echo "icons/{}" | rev | cut -d/ -f-3 | rev' \; | xargs -d '\n' -I {} sh -c 'rm -f {{ iconsdir }}/{}'
+    rm -f {{ sharedir }}/applications/{{ app-id }}.desktop
+    find data/'default_schema' -type f -exec sh -c 'echo "default_schema/{}" | rev | cut -d/ -f-3 | rev' \; | xargs -d '\n' -I {} sh -c 'rm -f {{ default-schema-target }}/{}'
+    rmdir {{ default-schema-target }}/{{ app-id }}/v1 {{ default-schema-target }}/{{ app-id }} 2>/dev/null || true
+
+# Compile, then install system-wide
+install-build: build-release install
