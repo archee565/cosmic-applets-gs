@@ -76,8 +76,6 @@ pub fn run() -> cosmic::iced::Result {
 struct AppletIconData {
     icon_size: u16,
     icon_spacing: f32,
-    dot_radius: f32,
-    bar_size: f32,
     padding: Padding,
 }
 
@@ -95,53 +93,15 @@ impl AppletIconData {
         };
         let icon_spacing = applet.spacing as f32;
 
-        let (dot_radius, bar_size) = match applet.size {
-            Size::Hardcoded(_) => (2.0, 8.0),
-            Size::PanelSize(ref s) => {
-                let size = s.get_applet_icon_size_with_padding(false);
-                // Define size thresholds, to handle custom sizes
-                let small_size_threshold = PanelSize::S.get_applet_icon_size_with_padding(false);
-                let medium_size_threshold = PanelSize::M.get_applet_icon_size_with_padding(false);
-                if size <= small_size_threshold {
-                    (1.0, 8.0)
-                } else if size <= medium_size_threshold {
-                    (2.0, 8.0)
-                } else {
-                    (2.0, 12.0)
-                }
-            }
-        };
         let padding = match applet.anchor {
-            PanelAnchor::Top => [
-                v_padding - (dot_radius * 2. + 1.),
-                h_padding,
-                v_padding,
-                h_padding,
-            ],
-            PanelAnchor::Bottom => [
-                v_padding,
-                h_padding,
-                v_padding - (dot_radius * 2. + 1.),
-                h_padding,
-            ],
-            PanelAnchor::Left => [
-                v_padding,
-                h_padding,
-                v_padding,
-                h_padding - (dot_radius * 2. + 1.),
-            ],
-            PanelAnchor::Right => [
-                v_padding,
-                h_padding - (dot_radius * 2. + 1.),
-                v_padding,
-                h_padding,
-            ],
+            PanelAnchor::Top => [0.0, h_padding, v_padding, h_padding],
+            PanelAnchor::Bottom => [v_padding, h_padding, 0.0, h_padding],
+            PanelAnchor::Left => [v_padding, h_padding, v_padding, 0.0],
+            PanelAnchor::Right => [v_padding, 0.0, v_padding, h_padding],
         };
         AppletIconData {
             icon_size,
             icon_spacing,
-            dot_radius,
-            bar_size,
             padding: padding.into(),
         }
     }
@@ -219,38 +179,40 @@ impl DockItem {
         .width(app_icon.icon_size.into())
         .height(app_icon.icon_size.into());
 
-        let indicator = {
-            let container = if toplevel_count <= 1 {
-                vertical_space().height(Length::Fixed(0.0))
-            } else {
-                match applet.anchor {
-                    PanelAnchor::Left | PanelAnchor::Right => {
-                        vertical_space().height(app_icon.bar_size)
-                    }
-                    PanelAnchor::Top | PanelAnchor::Bottom => {
-                        horizontal_space().width(app_icon.bar_size)
-                    }
+        let indicator = if is_focused {
+            let line_length = app_icon.icon_size as f32 * 1.0;
+            match applet.anchor {
+                PanelAnchor::Left | PanelAnchor::Right => {
+                    horizontal_space()
+                        .width(Length::Fixed(4.0))
+                        .height(line_length)
+                }
+                PanelAnchor::Top | PanelAnchor::Bottom => {
+                    vertical_space()
+                        .height(Length::Fixed(4.0))
+                        .width(line_length)
                 }
             }
             .apply(container)
-            .padding(app_icon.dot_radius);
-
-            if toplevel_count == 0 {
-                container
-            } else {
-                container.class(theme::Container::custom(move |theme| container::Style {
-                    background: if is_focused {
-                        Some(Background::Color(theme.cosmic().accent_color().into()))
-                    } else {
-                        Some(Background::Color(theme.cosmic().on_bg_color().into()))
-                    },
-                    border: Border {
-                        radius: dot_border_radius.into(),
-                        ..Default::default()
-                    },
+            .class(theme::Container::custom(move |theme| container::Style {
+                background: Some(Background::Color(theme.cosmic().accent_color().into())),
+                border: Border {
+                    radius: dot_border_radius.into(),
                     ..Default::default()
-                }))
+                },
+                ..Default::default()
+            }))
+        } else {
+            match applet.anchor {
+                PanelAnchor::Left | PanelAnchor::Right => {
+                    horizontal_space().width(Length::Fixed(4.0))
+                }
+                PanelAnchor::Top | PanelAnchor::Bottom => {
+                    vertical_space().height(Length::Fixed(4.0))
+                }
             }
+            .apply(container)
+            .into()
         };
 
         let icon_wrapper: Element<_> = match applet.anchor {
@@ -687,23 +649,21 @@ impl CosmicWinList {
                 .iter()
                 .any(|workspace| toplevel_info.workspace.contains(workspace));
 
-        match &self.config.filter_top_levels {
-            None => true,
-            Some(ToplevelFilter::ActiveWorkspace) => on_active_workspace,
-            Some(ToplevelFilter::ConfiguredOutput) => {
-                let on_active_output = self
-                    .output_list
+        let on_active_output = self
+            .output_list
+            .iter()
+            .find(|(_, info)| info.name.as_ref() == Some(&self.core.applet.output_name))
+            .map_or(true, |(active_output, _)| {
+                toplevel_info
+                    .output
                     .iter()
-                    .find(|(_, info)| info.name.as_ref() == Some(&self.core.applet.output_name))
-                    .map_or(true, |(active_output, _)| {
-                        toplevel_info
-                            .output
-                            .iter()
-                            .any(|output| output == active_output)
-                    });
+                    .any(|output| output == active_output)
+            });
 
-                on_active_output && on_active_workspace
-            }
+        match &self.config.filter_top_levels {
+            None => on_active_output,
+            Some(ToplevelFilter::ActiveWorkspace) => on_active_workspace,
+            Some(ToplevelFilter::ConfiguredOutput) => on_active_output && on_active_workspace,
         }
     }
 
@@ -880,7 +840,13 @@ impl CosmicWinList {
     fn pinned_has_active_window(&self, pinned_app_id: &str) -> bool {
         self.active_list
             .iter()
-            .any(|item| item.original_app_id == pinned_app_id)
+            .any(|item| {
+                item.original_app_id == pinned_app_id
+                    && item
+                        .toplevels
+                        .iter()
+                        .any(|(info, _)| self.is_on_current_monitor_and_workspace(info))
+            })
     }
 }
 
