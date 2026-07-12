@@ -169,15 +169,21 @@ impl DockItem {
         };
         let toplevel_count = filtered_toplevels.len();
 
+        let minimized = toplevel_count > 0
+            && filtered_toplevels
+                .iter()
+                .all(|(info, _)| info.state.contains(&State::Minimized));
+
         let app_icon = AppletIconData::new(applet);
 
+        let icon_scale: f32 = if minimized { 0.75 } else { 1.0 };
         let cosmic_icon = cosmic::widget::icon(
             fde::IconSource::from_unknown(desktop_info.icon().unwrap_or_default()).as_cosmic_icon(),
         )
         // sets the preferred icon size variant
         .size(128)
-        .width(app_icon.icon_size.into())
-        .height(app_icon.icon_size.into());
+        .width(Length::Fixed(app_icon.icon_size as f32 * icon_scale))
+        .height(Length::Fixed(app_icon.icon_size as f32 * icon_scale));
 
         let indicator = if is_focused {
             let line_length = app_icon.icon_size as f32 * 1.0;
@@ -649,16 +655,19 @@ impl CosmicWinList {
                 .iter()
                 .any(|workspace| toplevel_info.workspace.contains(workspace));
 
-        let on_active_output = self
-            .output_list
-            .iter()
-            .find(|(_, info)| info.name.as_ref() == Some(&self.core.applet.output_name))
-            .map_or(true, |(active_output, _)| {
-                toplevel_info
-                    .output
-                    .iter()
-                    .any(|output| output == active_output)
-            });
+        let on_active_output = if toplevel_info.output.is_empty() {
+            true
+        } else {
+            self.output_list
+                .iter()
+                .find(|(_, info)| info.name.as_ref() == Some(&self.core.applet.output_name))
+                .map_or(true, |(active_output, _)| {
+                    toplevel_info
+                        .output
+                        .iter()
+                        .any(|output| output == active_output)
+                })
+        };
 
         match &self.config.filter_top_levels {
             None => on_active_output,
@@ -767,11 +776,12 @@ impl CosmicWinList {
                     && active_workspaces
                         .iter()
                         .any(|workspace| t_info.workspace.contains(workspace))
-                    && t_info.output.iter().any(|x| {
-                        self.output_list.get(x).is_some_and(|val| {
-                            val.name.as_ref().is_some_and(|n| n == current_output)
-                        })
-                    })
+                    && (t_info.output.is_empty()
+                        || t_info.output.iter().any(|x| {
+                            self.output_list.get(x).is_some_and(|val| {
+                                val.name.as_ref().is_some_and(|n| n == current_output)
+                            })
+                        }))
                 {
                     focused_toplevels.push(t_info.foreign_toplevel.clone());
                 }
@@ -1514,7 +1524,11 @@ impl cosmic::Application for CosmicWinList {
                                     .find(|(t_info, _)| t_info.foreign_toplevel == info.foreign_toplevel);
                                 let updated_appid = if let Some((t_info, _)) = toplevel {
                                     let changed = info.app_id != t_info.app_id;
+                                    let saved_output = t_info.output.clone();
                                     *t_info = info.clone();
+                                    if t_info.output.is_empty() && !saved_output.is_empty() {
+                                        t_info.output = saved_output;
+                                    }
                                     changed
                                 } else {
                                     false
