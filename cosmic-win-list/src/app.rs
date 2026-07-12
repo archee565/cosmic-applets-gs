@@ -1749,7 +1749,7 @@ impl cosmic::Application for CosmicWinList {
                             DragSource::Favorites,
                         ),
                         dock_item.tooltip_text(&self.locales).into_owned(),
-                        self.popup.is_some(),
+                        self.popup.is_some() || self.drag_state.is_some(),
                         Message::Surface,
                         None,
                     )
@@ -1821,7 +1821,7 @@ impl cosmic::Application for CosmicWinList {
                                 DragSource::Active,
                             ),
                             dock_item.tooltip_text(&self.locales).into_owned(),
-                            self.popup.is_some(),
+                            self.popup.is_some() || self.drag_state.is_some(),
                             Message::Surface,
                             None,
                         )
@@ -2205,7 +2205,7 @@ impl cosmic::Application for CosmicWinList {
                                 DragSource::Active,
                             ),
                             dock_item.tooltip_text(&self.locales).into_owned(),
-                            self.popup.is_some(),
+                            self.popup.is_some() || self.drag_state.is_some(),
                             Message::Surface,
                             Some(id),
                         )
@@ -2294,7 +2294,7 @@ impl cosmic::Application for CosmicWinList {
                             DragSource::Favorites,
                         ),
                         dock_item.tooltip_text(&self.locales).to_string(),
-                        self.popup.is_some(),
+                        self.popup.is_some() || self.drag_state.is_some(),
                         Message::Surface,
                         Some(id),
                     )
