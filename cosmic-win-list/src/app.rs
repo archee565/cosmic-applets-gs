@@ -28,10 +28,10 @@ use cosmic::{
     cosmic_config::{Config, CosmicConfigEntry},
     desktop::IconSourceExt,
     iced::{
-        self, Alignment, Background, Border, Length, Limits, Padding, Subscription,
+        self, Alignment, Background, Border, Length, Limits, Padding, Point, Subscription,
         advanced::text::{Ellipsize, EllipsizeHeightLimit},
         event::listen_with,
-        platform_specific::shell::commands::popup::{destroy_popup, get_popup},
+        platform_specific::shell::commands::popup::destroy_popup,
         runtime::{core::event, platform_specific::wayland::CornerRadius},
         widget::{
             Column, Row, column, mouse_area, row,
@@ -116,6 +116,12 @@ impl From<usize> for DockItemId {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DragSource {
+    Favorites,
+    Active,
+}
+
 #[derive(Debug, Clone)]
 struct DockItem {
     // ID used internally in the applet. Each dock item
@@ -140,6 +146,7 @@ impl DockItem {
         dot_border_radius: [f32; 4],
         window_id: window::Id,
         filter: Option<&dyn Fn(&ToplevelInfo) -> bool>,
+        drag_source: DragSource,
     ) -> Element<'_, Message> {
         let Self {
             toplevels,
@@ -246,21 +253,25 @@ impl DockItem {
             .selected(is_focused)
             .class(app_list_icon_style(is_focused));
 
+        let click_command = if toplevel_count == 0 {
+            launch_on_preferred_gpu(desktop_info, gpus)
+        } else if toplevel_count == 1 {
+            filtered_toplevels
+                .first()
+                .map(|t| Message::Toggle(t.0.foreign_toplevel.clone()))
+        } else {
+            Some(Message::ToplevelListPopup(*id, window_id))
+        };
+
         let icon_button: Element<_> = if interaction_enabled {
             mouse_area(
                 icon_button
-                    .on_press_maybe(if toplevel_count == 0 {
-                        launch_on_preferred_gpu(desktop_info, gpus)
-                    } else if toplevel_count == 1 {
-                        filtered_toplevels
-                            .first()
-                            .map(|t| Message::Toggle(t.0.foreign_toplevel.clone()))
-                    } else {
-                        Some(Message::ToplevelListPopup(*id, window_id))
-                    })
                     .width(Length::Shrink)
                     .height(Length::Shrink),
             )
+            .on_press(Message::DragPress(*id, drag_source, click_command.map(Box::new)))
+            .on_release(Message::DragRelease(*id, drag_source))
+            .on_drag(Message::DragStart(*id, drag_source))
             .on_right_release(Message::Popup(*id, window_id))
             .on_middle_release({
                 launch_on_preferred_gpu(desktop_info, gpus)
@@ -322,7 +333,19 @@ struct CosmicWinList {
     hovered_toplevel: Option<ExtForeignToplevelHandleV1>,
     overflow_favorites_popup: Option<window::Id>,
     overflow_active_popup: Option<window::Id>,
+    drag_state: Option<DragState>,
+    drag_pending_command: Option<Box<Message>>,
 }
+
+#[derive(Debug, Clone, Copy)]
+struct DragState {
+    item_id: u32,
+    from: DragSource,
+    last_cursor: Point,
+    tick_scheduled: bool,
+}
+
+const DRAG_COOLDOWN_MS: u64 = 120;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum PopupType {
@@ -355,6 +378,11 @@ enum Message {
     OpenFavorites,
     OpenActive,
     Surface(surface::Action),
+    DragPress(u32, DragSource, Option<Box<Message>>),
+    DragRelease(u32, DragSource),
+    DragStart(u32, DragSource),
+    DragMove(iced::Point),
+    DragTick,
 }
 
 async fn try_get_gpus() -> Option<Vec<Gpu>> {
@@ -1466,6 +1494,186 @@ impl cosmic::Application for CosmicWinList {
                     cosmic::app::Action::Surface(a),
                 ));
             }
+            Message::DragPress(_id, _source, command) => {
+                self.drag_pending_command = command;
+            }
+            Message::DragRelease(_id, source) => {
+                if self.drag_state.is_some() {
+                    self.drag_state = None;
+                    self.drag_pending_command = None;
+                    if source == DragSource::Favorites {
+                        let new_order: Vec<String> = self
+                            .pinned_list
+                            .iter()
+                            .map(|item| item.original_app_id.clone())
+                            .collect();
+                        if let Ok(config) = Config::new(APP_ID, WinListConfig::VERSION) {
+                            self.config.update_pinned(new_order, &config);
+                        }
+                    }
+                } else if let Some(cmd) = self.drag_pending_command.take() {
+                    return Task::done(cosmic::Action::App(*cmd));
+                }
+                self.drag_pending_command = None;
+            }
+            Message::DragStart(id, source) => {
+                self.drag_pending_command = None;
+                self.drag_state = Some(DragState {
+                    item_id: id,
+                    from: source,
+                    last_cursor: Point::new(0.0, 0.0),
+                    tick_scheduled: false,
+                });
+            }
+            Message::DragMove(position) => {
+                if let Some(ref mut drag) = self.drag_state {
+                    drag.last_cursor = position;
+                    if !drag.tick_scheduled {
+                        drag.tick_scheduled = true;
+                        return Task::perform(
+                            tokio::time::sleep(Duration::from_millis(DRAG_COOLDOWN_MS)),
+                            |_| cosmic::Action::App(Message::DragTick),
+                        );
+                    }
+                }
+            }
+            Message::DragTick => {
+                let Some(drag) = self.drag_state else {
+                    return Task::none();
+                };
+                let is_horizontal = match self.core.applet.anchor {
+                    PanelAnchor::Top | PanelAnchor::Bottom => true,
+                    PanelAnchor::Left | PanelAnchor::Right => false,
+                };
+
+                let drag_rect = self.rectangles.get(&DockItemId::Item(drag.item_id)).copied();
+                let Some(drag_rect) = drag_rect else {
+                    return Task::perform(
+                        tokio::time::sleep(Duration::from_millis(DRAG_COOLDOWN_MS)),
+                        |_| cosmic::Action::App(Message::DragTick),
+                    );
+                };
+
+                let drag_center = if is_horizontal {
+                    drag_rect.x + drag_rect.width / 2.0
+                } else {
+                    drag_rect.y + drag_rect.height / 2.0
+                };
+
+                let cursor_val = if is_horizontal {
+                    drag.last_cursor.x
+                } else {
+                    drag.last_cursor.y
+                };
+
+                let direction: i32 = if cursor_val > drag_center { 1 } else { -1 };
+
+                let list: &Vec<DockItem> = match drag.from {
+                    DragSource::Favorites => &self.pinned_list,
+                    DragSource::Active => &self.active_list,
+                };
+
+                let Some(drag_idx) = list.iter().position(|item| item.id == drag.item_id) else {
+                    self.drag_state = None;
+                    return Task::none();
+                };
+
+                let visible_items: Vec<(usize, u32)> = list
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, item)| {
+                        self.rectangles
+                            .contains_key(&DockItemId::Item(item.id))
+                    })
+                    .map(|(i, item)| (i, item.id))
+                    .collect();
+
+                let Some(visible_pos) = visible_items
+                    .iter()
+                    .position(|(_, id)| *id == drag.item_id)
+                else {
+                    return Task::perform(
+                        tokio::time::sleep(Duration::from_millis(DRAG_COOLDOWN_MS)),
+                        |_| cosmic::Action::App(Message::DragTick),
+                    );
+                };
+
+                let target_visible_pos = if direction > 0 {
+                    visible_pos + 1
+                } else {
+                    match visible_pos.checked_sub(1) {
+                        Some(p) => p,
+                        None => {
+                            return Task::perform(
+                                tokio::time::sleep(Duration::from_millis(DRAG_COOLDOWN_MS)),
+                                |_| cosmic::Action::App(Message::DragTick),
+                            );
+                        }
+                    }
+                };
+
+                if target_visible_pos >= visible_items.len() {
+                    return Task::perform(
+                        tokio::time::sleep(Duration::from_millis(DRAG_COOLDOWN_MS)),
+                        |_| cosmic::Action::App(Message::DragTick),
+                    );
+                }
+
+                let (target_list_idx, target_id) = visible_items[target_visible_pos];
+                let target_rect = self
+                    .rectangles
+                    .get(&DockItemId::Item(target_id))
+                    .copied();
+
+                let Some(target_rect) = target_rect else {
+                    return Task::perform(
+                        tokio::time::sleep(Duration::from_millis(DRAG_COOLDOWN_MS)),
+                        |_| cosmic::Action::App(Message::DragTick),
+                    );
+                };
+
+                let dragged_edge = if direction > 0 {
+                    if is_horizontal {
+                        drag_rect.x + drag_rect.width
+                    } else {
+                        drag_rect.y + drag_rect.height
+                    }
+                } else if is_horizontal {
+                    drag_rect.x
+                } else {
+                    drag_rect.y
+                };
+                let target_edge = if direction > 0 {
+                    if is_horizontal {
+                        target_rect.x
+                    } else {
+                        target_rect.y
+                    }
+                } else if is_horizontal {
+                    target_rect.x + target_rect.width
+                } else {
+                    target_rect.y + target_rect.height
+                };
+
+                let crossed = if direction > 0 {
+                    cursor_val > (dragged_edge + target_edge) / 2.0
+                } else {
+                    cursor_val < (dragged_edge + target_edge) / 2.0
+                };
+
+                if crossed {
+                    let list: &mut Vec<DockItem> = match drag.from {
+                        DragSource::Favorites => &mut self.pinned_list,
+                        DragSource::Active => &mut self.active_list,
+                    };
+                    list.swap(drag_idx, target_list_idx);
+                }
+
+                return Task::perform(
+                    tokio::time::sleep(Duration::from_millis(DRAG_COOLDOWN_MS)),
+                    |_| cosmic::Action::App(Message::DragTick),
+                );
+            }
         }
 
         Task::none()
@@ -1538,6 +1746,7 @@ impl cosmic::Application for CosmicWinList {
                             dot_radius,
                             self.core.main_window_id().unwrap(),
                             Some(&|info| self.is_on_current_monitor_and_workspace(info)),
+                            DragSource::Favorites,
                         ),
                         dock_item.tooltip_text(&self.locales).into_owned(),
                         self.popup.is_some(),
@@ -1609,6 +1818,7 @@ impl cosmic::Application for CosmicWinList {
                                 dot_radius,
                                 self.core.main_window_id().unwrap(),
                                 Some(&|info| self.is_on_current_monitor_and_workspace(info)),
+                                DragSource::Active,
                             ),
                             dock_item.tooltip_text(&self.locales).into_owned(),
                             self.popup.is_some(),
@@ -1992,6 +2202,7 @@ impl cosmic::Application for CosmicWinList {
                                 dot_radius,
                                 id,
                                 Some(&|info| self.is_on_current_monitor_and_workspace(info)),
+                                DragSource::Active,
                             ),
                             dock_item.tooltip_text(&self.locales).into_owned(),
                             self.popup.is_some(),
@@ -2071,22 +2282,23 @@ impl cosmic::Application for CosmicWinList {
                     self.core
                         .applet
                         .applet_tooltip(
-                            dock_item.as_icon(
-                                &self.core.applet,
-                                self.rectangle_tracker.as_ref(),
-                                self.popup.is_none(),
-                                self.gpus.as_deref(),
-                                filtered_is_focused,
-                                dot_radius,
-                                id,
-                                Some(&|info| self.is_on_current_monitor_and_workspace(info)),
-                            ),
-                            dock_item.tooltip_text(&self.locales).to_string(),
-                            self.popup.is_some(),
-                            Message::Surface,
-                            Some(id),
-                        )
-                        .into()
+                        dock_item.as_icon(
+                            &self.core.applet,
+                            self.rectangle_tracker.as_ref(),
+                            self.popup.is_none(),
+                            self.gpus.as_deref(),
+                            filtered_is_focused,
+                            dot_radius,
+                            id,
+                            Some(&|info| self.is_on_current_monitor_and_workspace(info)),
+                            DragSource::Favorites,
+                        ),
+                        dock_item.tooltip_text(&self.locales).to_string(),
+                        self.popup.is_some(),
+                        Message::Surface,
+                        Some(id),
+                    )
+                    .into()
                 })
                 .collect();
             let content = match &self.core.applet.anchor {
@@ -2146,6 +2358,13 @@ impl cosmic::Application for CosmicWinList {
                 cosmic::iced::core::Event::Mouse(
                     cosmic::iced::core::mouse::Event::ButtonPressed(_),
                 ) => Some(Message::Pressed(id)),
+                cosmic::iced::core::Event::Mouse(
+                    cosmic::iced::core::mouse::Event::CursorMoved { position },
+                ) => {
+                    Some(Message::DragMove(
+                        iced::Point::new(position.x, position.y),
+                    ))
+                }
                 _ => None,
             }),
             rectangle_tracker_subscription(0).map(|update| Message::Rectangle(update.1)),
