@@ -28,7 +28,7 @@ impl Default for WinListConfig {
         Self {
             filter_top_levels: None,
             favorites: Vec::new(),
-            enable_drag_source: true,
+            enable_drag_source: false,
         }
     }
 }

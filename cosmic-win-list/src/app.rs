@@ -929,10 +929,12 @@ impl cosmic::Application for CosmicWinList {
                         tracing::error!("No rectangle found for toplevel group");
                         return Task::none();
                     };
-                    let corners = self.core.system_theme().cosmic().corner_radii.radius_s;
                     let popup_task =
                         cosmic::surface::surface_task(cosmic::surface::action::app_popup(
-                            move |_| LiveSettings::default(),
+                            move |_| LiveSettings {
+                                corners: Some(CornerRadius::default()),
+                                ..Default::default()
+                            },
                             move |app: &mut Self| {
                                 let new_id = window::Id::unique();
                                 app.popup = Some(Popup {
@@ -1013,7 +1015,10 @@ impl cosmic::Application for CosmicWinList {
                     });
                     let popup_task =
                         cosmic::surface::surface_task(cosmic::surface::action::app_popup(
-                            |_| Default::default(),
+                            |_| LiveSettings {
+                                corners: Some(CornerRadius::default()),
+                                ..Default::default()
+                            },
                             move |app: &mut Self| {
                                 let mut popup_settings = app.core.applet.get_popup_settings(
                                     parent_window_id,
@@ -1341,51 +1346,17 @@ impl cosmic::Application for CosmicWinList {
             }
             Message::DndDropFinished(drag_id) => {
                 if self.dnd_source.is_some() {
-                    // Internal drag: the item is already live-reordered in its
-                    // source list. Cross-section drops migrate it now.
-                    let (item_id, is_pinned) = self
+                    let (_, is_pinned) = self
                         .dnd_source
                         .as_ref()
                         .map(|s| (s.1.id, s.4))
                         .unwrap();
                     let source_section = if is_pinned { DND_FAVORITES } else { DND_ACTIVE };
                     if drag_id == source_section {
-                        // Same section: nothing to do, the live reorder already
-                        // placed the item.
                         self.dnd_item_placed = true;
-                    } else if !is_pinned && drag_id == DND_FAVORITES {
-                        // Active -> favorites: pin the dragged window's app.
-                        let dock_item = self
-                            .active_list
-                            .iter()
-                            .position(|t| t.id == item_id)
-                            .map(|idx| self.active_list.remove(idx));
-                        if let Some(mut dock_item) = dock_item {
-                            dock_item.toplevels = Vec::new();
-                            if dock_item.desktop_info.exec().is_some() {
-                                let insert_idx = self
-                                    .dnd_offer
-                                    .as_ref()
-                                    .map(|o| o.preview_index)
-                                    .unwrap_or(0)
-                                    .min(self.pinned_list.len());
-                                self.pinned_list.insert(insert_idx, dock_item);
-                                if let Ok(config) = Config::new(APP_ID, WinListConfig::VERSION) {
-                                    self.config.update_pinned(
-                                        self.pinned_list
-                                            .iter()
-                                            .map(|di| di.original_app_id.clone())
-                                            .collect(),
-                                        &config,
-                                    );
-                                }
-                                self.dnd_item_placed = true;
-                            }
-                        }
                     }
-                    // favorites -> active is not meaningful (pinned launchers
-                    // carry no toplevels); leave dnd_item_placed false so the
-                    // item rewinds to its original position.
+                    // Cross-section drops are not allowed; leaving
+                    // dnd_item_placed false rewinds the item.
                 } else if let Some((mut dock_item, index, _)) = self
                     .dnd_offer
                     .take()
@@ -1683,7 +1654,10 @@ impl cosmic::Application for CosmicWinList {
 
                     let popup_task =
                         cosmic::surface::surface_task(cosmic::surface::action::app_popup(
-                            |_| Default::default(),
+                            |_| LiveSettings {
+                                corners: Some(CornerRadius::default()),
+                                ..Default::default()
+                            },
                             move |app: &mut Self| {
                                 let mut popup_settings = app.core.applet.get_popup_settings(
                                     app.core.main_window_id().unwrap(),
@@ -1751,7 +1725,10 @@ impl cosmic::Application for CosmicWinList {
 
                     let popup_task =
                         cosmic::surface::surface_task(cosmic::surface::action::app_popup(
-                            |_| Default::default(),
+                            |_| LiveSettings {
+                                corners: Some(CornerRadius::default()),
+                                ..Default::default()
+                            },
                             move |app: &mut Self| {
                                 let mut popup_settings = app.core.applet.get_popup_settings(
                                     app.core.main_window_id().unwrap(),
